@@ -1,0 +1,8 @@
+# Ignore environment and credentials files
+.env
+*.env
+service_account.json
+
+# Python caches
+__pycache__/
+*.py[cod]
