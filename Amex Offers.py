@@ -32,9 +32,8 @@ print("imports loaded")
 # --------------------------------------------------
 from dotenv import load_dotenv; load_dotenv()
 
-LOGIN_URL  = "https://secure.chase.com/web/auth/dashboard#/login"
-OFFERS_URL = ("https://secure.chase.com/web/auth/dashboard#/"
-              "dashboard/merchantOffers/offerCategoriesPage")
+LOGIN_URL  = "https://global.americanexpress.com/offers/eligible"
+OFFERS_URL = "https://global.americanexpress.com/offers/eligible"
 
 DEDUP_FILE = "added_offers.txt"
 SCOPES     = ["https://www.googleapis.com/auth/spreadsheets",
@@ -104,7 +103,7 @@ def build_driver():
     opts = Options(); opts.add_argument("--start-maximized")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument(f"--user-data-dir={os.getcwd()}/chase_{int(time.time())}")
+    opts.add_argument(f"--user-data-dir={os.getcwd()}/amex_{int(time.time())}")
     drv = webdriver.Chrome(service=Service(ChromeDriverManager().install()),
                            options=opts)
     drv.implicitly_wait(8); drv.set_page_load_timeout(60)
@@ -123,10 +122,10 @@ def page_ready(drv): return drv.current_url.startswith(OFFERS_URL)
 print("page_ready loaded")
 
 def plus_icons(drv):
-    """Return list of 'Add offer' plus icons (un-enrolled offers)."""
+    """Return list of 'Add to Card' buttons (un-enrolled offers)."""
     return drv.find_elements(
-        By.CSS_SELECTOR,
-        "mds-icon[data-testid='commerce-tile-button']"
+        By.XPATH,
+        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'add to card')]"
     )
 print("plus_icons loaded")
 
@@ -182,27 +181,34 @@ print("parse_vals loaded")
 # --------------------------------------------------
 # offer loop
 # --------------------------------------------------
-def process(drv, wait, holder:str, card_name:str="Chase"):
-    """Click every plus icon, scrape details, push to Sheet."""
+def process(drv, wait, holder:str, card_name:str="Amex"):
+    """Click every 'Add to Card' button, scrape details, push to Sheet."""
     done = load_keys(); new_rows=[]
     while (icons := plus_icons(drv)):
-        ico = icons[0]
-        aria = ico.get_attribute("aria-label") or ""
-        m = re.search(r"of \d+\s+(.*?)\s+(\d+%.*?)\s+(\d+)\s+days", aria)
-        brand, disc, days = m.groups() if m else ("Unknown","", "0")
-        last4_m = re.search(r"ending in (\d{4})", aria)
-        last4 = last4_m.group(1) if last4_m else "XXXX"
+        btn = icons[0]
+        try:
+            tile = btn.find_element(By.XPATH, "./ancestor::*[contains(@class,'offer')]")
+            text = tile.text
+        except Exception:
+            text = ""
+        brand = text.split("\n")[0] if text else "Unknown"
+        disc_match = re.search(r"(\d+%|\$\d+)", text)
+        disc = disc_match.group(0) if disc_match else ""
+        days_match = re.search(r"(\d+)\s+days", text)
+        days = days_match.group(1) if days_match else "0"
+        last4 = "XXXX"
         key = f"{holder}|{last4}|{brand}|{disc}"
         if key in done:
             icons.pop(0); continue
-        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", ico)
-        time.sleep(0.3); ico.click()
+        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        time.sleep(0.3); btn.click()
         wait.until(lambda d: not plus_icons(d) or d.current_url!=OFFERS_URL)
         txt  = modal_body(drv)
         maxd, mind = parse_vals(txt)
         try:
             exp = (datetime.today()+timedelta(days=int(days))).strftime("%m/%d/%Y")
-        except: exp = ""
+        except Exception:
+            exp = ""
         local = "Yes" if "philadelphia" in txt.lower() else "No"
         row   = (holder,last4,card_name,brand,disc,maxd,mind,exp,local)
         if OFFER_WS: new_rows.append(list(row))
@@ -227,9 +233,9 @@ print("process loaded")
 def main():
     drv, wait = build_driver()
     drv.get(LOGIN_URL)
-    print("→ Log in manually, then open Chase Offers page – script will wait.")
+    print("→ Log in manually, then open Amex Offers page – script will wait.")
     wait_for_login(drv)
-    holder = os.getenv("CHASE_HOLDER_NAME","Primary")
+    holder = os.getenv("AMEX_HOLDER_NAME","Primary")
     process(drv, wait, holder)
     print("✔ All offers processed – browser left open. Ctrl+C to exit.")
     try:
