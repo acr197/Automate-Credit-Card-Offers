@@ -2,7 +2,7 @@ import os
 import time
 import random
 from datetime import datetime
-from typing import List, Tuple
+from typing import List
 
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -35,6 +35,8 @@ def append_offer(worksheet, holder: str, offer: str):
         [datetime.utcnow().isoformat(), holder, offer],
         value_input_option="USER_ENTERED",
     )
+    # Reapply filter so new rows are included
+    worksheet.set_basic_filter()
 
 
 # --- Selenium helpers ------------------------------------------------------
@@ -142,28 +144,35 @@ def run_account(username: str, password: str, holder: str, worksheet):
             pass
 
 
+def run_manual(holder: str, worksheet):
+    driver = build_driver()
+    try:
+        driver.get(OFFERS_URL)
+        input(
+            "\nLog in to American Express and navigate to the offers page.\n"
+            "When you are ready to add offers, press Enter here to continue..."
+        )
+        expand_offers(driver)
+        add_offers(driver, worksheet, holder)
+        logout(driver)
+    finally:
+        try:
+            driver.quit()
+        except WebDriverException:
+            pass
+
+
 def main():
     load_dotenv()
     sa_path = os.getenv("GOOGLE_SA_PATH")
     worksheet = get_sheet(sa_path)
 
-    accounts: List[Tuple[str, str, str]] = [
-        (
-            os.getenv("AMEX_USERNAME_1"),
-            os.getenv("AMEX_PASSWORD_1"),
-            os.getenv("AMEX_HOLDER_1"),
-        ),
-        (
-            os.getenv("AMEX_USERNAME_2"),
-            os.getenv("AMEX_PASSWORD_2"),
-            os.getenv("AMEX_HOLDER_2"),
-        ),
-    ]
+    holders = [os.getenv("AMEX_HOLDER_1"), os.getenv("AMEX_HOLDER_2")]
 
-    for username, password, holder in accounts:
-        if not username or not password:
+    for holder in holders:
+        if not holder:
             continue
-        run_account(username, password, holder, worksheet)
+        run_manual(holder, worksheet)
 
 
 if __name__ == "__main__":
