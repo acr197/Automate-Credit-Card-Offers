@@ -1,98 +1,101 @@
 # ---------------------------------------------------------------------------
-# Section: imports
+# Chase Offers – stable, clean rewrite
 # ---------------------------------------------------------------------------
-
-# Core libraries, Selenium, and Google Sheets dependencies
+# .env expected keys (examples only; don't paste your real ones here):
+#   CHASE_USERNAME_1=...
+#   CHASE_PASSWORD_1=...
+#   CHASE_HOLDER=Andrew
+#   GOOGLE_SA_PATH=C:\path\to\service_account.json
+#   GOOGLE_SHEET_KEY=13M4YcJ5vPq4VEeNg1KOmE0QRyRVs9EDrroy66jH6iCs
+#   (optional) WINDOW_OFFSET=3440,0
+#   (optional) CLOSE_ON_EXIT=false
+# ---------------------------------------------------------------------------
 
 import os
 import re
 import sys
 import time
-from datetime import datetime, date
+from datetime import datetime, timedelta, date
 from typing import List, Set, Tuple, Optional
 
 import gspread
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
+
 from selenium import webdriver
-from selenium.common.exceptions import (
-    InvalidSessionIdException,
-    WebDriverException,
-    TimeoutException,
-)
+from selenium.common.exceptions import WebDriverException, InvalidSessionIdException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
-print("Section 'imports' complete – modules loaded successfully.")
-
-# ---------------------------------------------------------------------------
-# Section: configuration & constants
-# ---------------------------------------------------------------------------
-
-# Load environment, validate required files, and set globals
-
+# -------------------------------
+# Config & env
+# -------------------------------
 def require_file(path: str, description: str) -> str:
-    """Exit if a required file is missing."""
     if not os.path.isfile(path):
         sys.exit(f"Required {description} not found: '{path}' – aborting")
     return path
 
-
-print("Function 'require_file' loaded – validates required files exist.")
-
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
-print("Environment loaded – .env variables available.")
+print("Env loaded.")
 
-# Assemble Citi account credentials from .env
-ACCOUNTS: List[dict] = []
-idx = 1
-while os.getenv(f"CITI_USERNAME_{idx}"):
-    ACCOUNTS.append({
-        "user":   os.getenv(f"CITI_USERNAME_{idx}"),
-        "pass":   os.getenv(f"CITI_PASSWORD_{idx}"),
-        "holder": os.getenv(f"CITI_HOLDER_{idx}", f"Holder {idx}"),
-    })
-    idx += 1
-if not ACCOUNTS:
-    sys.exit("No Citi accounts found in .env – aborting")
-print(f"Accounts loaded – {len(ACCOUNTS)} account(s) configured.")
+U1 = os.getenv("CHASE_USERNAME_1", "").strip()
+P1 = os.getenv("CHASE_PASSWORD_1", "").strip()
+if not (U1 and P1):
+    sys.exit("Missing CHASE_USERNAME_1 / CHASE_PASSWORD_1 in .env")
 
-# Citi URLs and window placement
-LOGIN_URL  = "https://online.citi.com/US/login.do"
-# IMPORTANT: official Merchant Offers URL – always target this.
-OFFERS_URL = "https://online.citi.com/US/ag/products-offers/merchantoffers"
-HOME_URL = "https://online.citi.com/US/home"
-SECOND_MONITOR_OFFSET = (3440, 0)
-
-# Tuneable navigation constants
-PAGE_LOAD_PAUSE = float(os.getenv("CITI_PAGE_LOAD_PAUSE", "4.0"))
-OFFERS_RETRY_MAX = int(os.getenv("CITI_OFFERS_RETRY_MAX", "8"))
-NAV_MENU_FALLBACK = os.getenv("CITI_NAV_MENU_FALLBACK", "true").lower() == "true"
-RESTART_BETWEEN_ACCOUNTS = os.getenv("CITI_RESTART_BETWEEN_ACCOUNTS", "true").lower() == "true"
-print("Constants ready – navigation timing and retry settings applied.")
-
-print("Section 'configuration & constants' complete – runtime config set.")
-
-# ---------------------------------------------------------------------------
-# Section: Google Sheets bootstrap
-# ---------------------------------------------------------------------------
-
-# Initialize Google Sheets client and ensure worksheets/headers
-
+HOLDER = os.getenv("CHASE_HOLDER", "").strip()
+SHEET_KEY = os.getenv("GOOGLE_SHEET_KEY", "13M4YcJ5vPq4VEeNg1KOmE0QRyRVs9EDrroy66jH6iCs")
 SA_PATH = os.getenv("GOOGLE_SA_PATH", os.path.join(PROJECT_ROOT, "service_account.json"))
 require_file(SA_PATH, "Google service-account JSON")
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-          "https://www.googleapis.com/auth/drive"]
+
+# Card order (accountIds)
+ACCOUNT_IDS = [
+    "1091891200",  # Freedom Flex
+    "571406113",   # IHG Classic
+    "504430043",   # Ink Business Cash
+    "1095857180",  # Ink Preferred
+]
+
+# URLs
+CHASE_HOME_URL    = "https://www.chase.com/"
+CHASE_POST_LOGIN  = "https://secure.chase.com/web/auth/dashboard#/"
+CHASE_OFFER_HUB   = "https://secure.chase.com/web/auth/dashboard#/dashboard/merchantOffers/offer-hub"
+CHASE_OFFERS_PAGE = "https://secure.chase.com/web/auth/dashboard#/dashboard/merchantOffers/offerCategoriesPage"
+CHASE_2FA_FRAGMENT = "recognizeUser/provideAuthenticationCode"
+
+# Timing
+POLL_TICK        = float(os.getenv("CHASE_POLL_TICK", "0.06"))
+PAGE_LOAD_PAUSE  = float(os.getenv("CHASE_PAGE_LOAD_PAUSE", "0.60"))
+FAST_CLICK_DELAY = float(os.getenv("FAST_CLICK_DELAY", "0.25"))
+FAST_BACK_WAIT   = float(os.getenv("FAST_BACK_WAIT", "0.25"))
+FAST_BETWEEN     = float(os.getenv("FAST_BETWEEN", "0.25"))
+CARD_LOAD_PAUSE  = float(os.getenv("CARD_LOAD_PAUSE", "1.4"))
+LOGIN_WAIT_MAX   = int(os.getenv("CHASE_LOGIN_WAIT_MAX", "420"))
+
+# Window behavior
+CLOSE_ON_EXIT = os.getenv("CLOSE_ON_EXIT", "false").lower() == "true"
+SECOND_MONITOR_OFFSET = tuple(int(x) for x in os.getenv("WINDOW_OFFSET", "3440,0").split(","))
+
+# 2FA guards (module-level so they persist)
+_TWOFA_PASSWORD_DONE = False
+_TWOFA_LAST_ATTEMPT = 0.0
+
+# Sheets buffers
+APPEND_BUFFER: List[List[str]] = []
+CURRENT_CARD_BUFFER: List[List[str]] = []
+APPEND_CHUNK_SIZE = int(os.getenv("APPEND_CHUNK_SIZE", "400"))
+
+# -------------------------------
+# Sheets bootstrap
+# -------------------------------
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 CREDS  = Credentials.from_service_account_file(SA_PATH, scopes=SCOPES)
-SHEET  = gspread.authorize(CREDS).open("Credit Card Offers")
-print("Google Sheets client initialized – workbook opened.")
+SHEET  = gspread.authorize(CREDS).open_by_key(SHEET_KEY)
 
 OFFER_HEADERS = (
     "Card Holder", "Last Four", "Card Name", "Brand",
@@ -101,867 +104,799 @@ OFFER_HEADERS = (
 )
 
 def _ws(sheet, title: str, headers: Tuple[str, ...]):
-    """Create/get a worksheet and ensure header row."""
     existing = {w.title: w for w in sheet.worksheets()}
-    ws = existing.get(title) or sheet.add_worksheet(title=title, rows=2000, cols=len(headers))
-    first_row = ws.row_values(1)
-    if first_row != list(headers):
-        if not first_row:
+    ws = existing.get(title) or sheet.add_worksheet(title=title, rows=5000, cols=len(headers))
+    row1 = ws.row_values(1)
+    if row1 != list(headers):
+        if not row1:
             ws.append_row(list(headers), value_input_option="RAW")
         else:
             ws.update("1:1", [headers], value_input_option="RAW")
     return ws
 
-
-print("Function '_ws' loaded – worksheet bootstrap ready.")
-
 OFFER_WS = _ws(SHEET, "Card Offers", OFFER_HEADERS)
 LOG_WS   = _ws(SHEET, "Log", ("Time", "Level", "Function", "Message"))
-print("Worksheets ready – 'Card Offers' and 'Log' ensured.")
-
 
 def sheet_log(level: str, func: str, msg: str):
-    """Append a log entry to the Log worksheet."""
-    LOG_WS.append_row(
-        [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, func, msg],
-        value_input_option="RAW",
-        insert_data_option="INSERT_ROWS"
-    )
+    try:
+        LOG_WS.append_row(
+            [datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, func, msg],
+            value_input_option="RAW", insert_data_option="INSERT_ROWS"
+        )
+    except Exception as exc:
+        print(f"(Sheets log failed) {level} {func}: {msg} – {exc}")
 
-
-print("Function 'sheet_log' loaded – spreadsheet logging enabled.")
-
-def ensure_date_added_column():
-    """Backfill the Date Added column if missing."""
-    header = OFFER_WS.row_values(1)
-    if "Date Added" not in header:
-        idx = 8  # H
-        sid = OFFER_WS._properties["sheetId"]
-        SHEET.batch_update({
-            "requests": [{
-                "insertDimension": {
-                    "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": idx - 1, "endIndex": idx},
-                    "inheritFromBefore": True
-                }
-            }]
-        })
-        OFFER_WS.update_cell(1, idx, "Date Added")
-
-
-print("Function 'ensure_date_added_column' loaded – header self-heal ready.")
-ensure_date_added_column()
-
-def set_log_row_height():
-    """Make log rows readable with a fixed row height."""
-    sid = LOG_WS._properties["sheetId"]
-    SHEET.batch_update({
-        "requests": [{
-            "updateDimensionProperties": {
-                "range": {"sheetId": sid, "dimension": "ROWS"},
-                "properties": {"pixelSize": 21}, "fields": "pixelSize"
-            }
-        }]
-    })
-
-
-print("Function 'set_log_row_height' loaded – log sheet formatting ready.")
-set_log_row_height()
-
-print("Section 'Google Sheets bootstrap' complete – Sheets initialized.")
-
-# ---------------------------------------------------------------------------
-# Section: Selenium driver
-# ---------------------------------------------------------------------------
-
-# Create a Chrome WebDriver with default waits
-
+# -------------------------------
+# Driver
+# -------------------------------
 def build_driver() -> Tuple[webdriver.Chrome, WebDriverWait]:
-    """Create a Chrome driver and WebDriverWait helper."""
     opts = Options()
     opts.add_argument("--start-maximized")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
     drv = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
     try:
         drv.set_window_position(*SECOND_MONITOR_OFFSET)
     except Exception:
         pass
-    return drv, WebDriverWait(drv, 30)
-
-
-print("Function 'build_driver' loaded – Selenium driver factory ready.")
+    drv.set_page_load_timeout(90)
+    drv.implicitly_wait(0)
+    return drv, WebDriverWait(drv, 10)
 
 driver, wait = build_driver()
-print("Section 'Selenium driver' complete – driver and wait initialized.")
+print("Driver ready.")
 
-
-def restart_driver():
-    """Fully restart the browser to isolate accounts."""
-    global driver, wait
-    try:
-        driver.quit()
-    except Exception:
-        pass
-    driver, wait = build_driver()
-    print("Browser restarted – new driver instance created.")
-
-
-print("Function 'restart_driver' loaded – between-account isolation ready.")
-
-# ---------------------------------------------------------------------------
-# Section: page helpers (offers detection, errors, and healing)
-# ---------------------------------------------------------------------------
-
-# Detect offers, detect error states, dismiss popups, and harden navigation
-
-def offers_ready() -> bool:
-    """Return True when offer tiles appear."""
-    xp = ("//div[contains(@class,'offer-tile') or contains(@class,'mo-offer') or "
-          "contains(@data-testid,'offer-tile')]")
-    return bool(driver.find_elements(By.XPATH, xp))
-
-
-print("Function 'offers_ready' loaded – detects when offers are visible.")
-
-
-def error_banner_visible() -> bool:
-    """Return True when a known inline error banner is present."""
-    return bool(driver.find_elements(By.ID, "available-err-msg"))
-
-
-print("Function 'error_banner_visible' loaded – banner error detector ready.")
-
-
-def error_toast_visible() -> bool:
-    """Return True when an alert/toast error is present."""
-    xpath = (
-        "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'trouble loading your offers')]"
-        " | //*[@role='alert' or contains(@class,'alert') or contains(@class,'toast')]"
-        "[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'error')]"
-    )
-    return bool(driver.find_elements(By.XPATH, xpath))
-
-
-print("Function 'error_toast_visible' loaded – toast error detector ready.")
-
-
-def page_not_found_visible() -> bool:
-    """Detect a 404 / 'Page not found' experience."""
-    xp = (
-        "//*[self::h1 or self::h2]"
-        "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
-        "'page not found') or contains(.,'looks like that information isn')]"
-        " | //*[contains(@class,'notFound') or contains(@class,'not-found') or contains(@class,'error')]"
-        "[contains(.,'Page not found')]"
-    )
-    return bool(driver.find_elements(By.XPATH, xp))
-
-
-print("Function 'page_not_found_visible' loaded – 404 detector ready.")
-
-
-def click_no_thanks_if_present(timeout: int = 5) -> bool:
-    """Dismiss common promo/pop-up modals that block interaction."""
-    end = time.time() + timeout
-    sels = [
-        "//*[self::a or self::button][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'no thanks')]",
-        "//*[self::a or self::button][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'not now')]",
-        "//*[self::a or self::button][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'skip')]",
-        "//*[self::a or self::button][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'dismiss')]",
-        "//*[@role='dialog']//button[@aria-label='Close' or contains(@class,'close')]",
-        "//button[@aria-label='Close' or contains(@class,'close')]",
-    ]
-    while time.time() < end:
-        clicked = False
-        for xp in sels:
-            for el in driver.find_elements(By.XPATH, xp):
-                if el.is_displayed():
-                    try:
-                        driver.execute_script("arguments[0].click();", el)
-                        clicked = True
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-        if clicked:
-            return True
-        time.sleep(0.25)
-    return False
-
-
-print("Function 'click_no_thanks_if_present' loaded – popup dismissor ready.")
-
-def logged_in() -> bool:
-    """Heuristic to confirm we are authenticated."""
-    u = driver.current_url
-    return "/dashboard" in u or "merchantoffers" in u
-
-
-print("Function 'logged_in' loaded – session state heuristic ready.")
-
-
-def clear_web_storage():
-    """Clear local/session storage in case Citi UI caches a bad route."""
-    try:
-        driver.execute_script("window.localStorage.clear(); window.sessionStorage.clear();")
-    except Exception:
-        pass
-
-
-print("Function 'clear_web_storage' loaded – storage reset ready.")
-
-
-def return_to_account_if_404(timeout: int = 6) -> bool:
-    """If 404 page shows, click 'Return to your account' to re-enter app."""
-    if not page_not_found_visible():
-        return False
-    try:
-        btn = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((
-            By.XPATH,
-            "//*[self::a or self::button][contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
-            "'return to your account')]"
-        )))
-        driver.execute_script("arguments[0].click();", btn)
-        time.sleep(1.8)
-        sheet_log("INFO", "nav", "Recovered via 'Return to your account'")
-        return True
-    except Exception:
-        return False
-
-
-print("Function 'return_to_account_if_404' loaded – 404 bounce recovery ready.")
-
-
-def nav_via_rewards_menu(timeout: int = 10) -> bool:
-    """Hover 'Rewards & Offers' and click 'Merchant Offers' to keep context."""
-    try:
-        nav = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((
-            By.XPATH,
-            "//*[self::a or self::button]"
-            "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'rewards & offers')]"
-        )))
-        ActionChains(driver).move_to_element(nav).pause(0.6).perform()
-        time.sleep(0.8)
-        link = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((
-            By.XPATH,
-            "//*[self::a or self::button]"
-            "[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'merchant offers')"
-            " or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'offers for you')"
-            " or contains(@href,'merchantoffers')]"
-        )))
-        driver.execute_script("arguments[0].click();", link)
-        time.sleep(PAGE_LOAD_PAUSE)
-        return True
-    except Exception:
-        # Fallback: click any visible link to merchantoffers
-        try:
-            link2 = WebDriverWait(driver, 4).until(EC.element_to_be_clickable((
-                By.XPATH, "//a[contains(@href,'merchantoffers')]"
-            )))
-            driver.execute_script("arguments[0].click();", link2)
-            time.sleep(PAGE_LOAD_PAUSE)
-            return True
-        except Exception:
-            return False
-
-
-print("Function 'nav_via_rewards_menu' loaded – menu-driven navigation ready.")
-
-
-def go_home_then_back():
-    """Visit Citi Home to re-anchor session, then retry Offers."""
-    try:
-        driver.get(HOME_URL)
-        time.sleep(2.0)
-    except Exception:
-        pass
-    try:
-        driver.get(OFFERS_URL)
-        time.sleep(PAGE_LOAD_PAUSE)
-    except Exception:
-        pass
-
-
-print("Function 'go_home_then_back' loaded – home-path recovery ready.")
-
-
-def robust_get(url: str, tries: int = 2) -> None:
-    """Navigate to URL with soft retries if 'Not found' renders."""
+# -------------------------------
+# Helpers: nav & typing
+# -------------------------------
+def robust_get(url: str, tries: int = 2) -> bool:
     last_exc = None
-    for i in range(1, tries + 1):
+    for i in range(max(1, tries)):
         try:
             driver.get(url)
             time.sleep(PAGE_LOAD_PAUSE)
-            click_no_thanks_if_present(3)
-            if not page_not_found_visible():
-                return
-            sheet_log("WARN", "nav", f"Not Found on try {i} for {url} – retrying")
-            time.sleep(1.0)
+            print(f"[nav] GET {i+1}: {driver.current_url}")
+            return True
         except WebDriverException as exc:
             last_exc = exc
-            sheet_log("WARN", "nav", f"driver.get failed (try {i}): {exc}")
-            time.sleep(1.0)
+            print(f"[nav] warning GET {i+1}: {exc}")
+            time.sleep(POLL_TICK)
+        try:
+            driver.execute_script("window.location.replace(arguments[0]);", url)
+            time.sleep(PAGE_LOAD_PAUSE)
+            print(f"[nav] JS {i+1}: {driver.current_url}")
+            return True
+        except Exception as exc2:
+            print(f"[nav] warning JS {i+1}: {exc2}")
+            time.sleep(POLL_TICK)
     if last_exc:
-        raise last_exc
-
-
-print("Function 'robust_get' loaded – guarded navigation helper ready.")
-
-
-def goto_offers_page(max_tries: int = OFFERS_RETRY_MAX) -> bool:
-    """Reach Merchant Offers reliably, healing 404s and slow loads."""
-
-    def on_offers() -> bool:
-        return ("merchantoffers" in driver.current_url) and (offers_ready() or not error_toast_visible())
-
-    for attempt in range(1, max_tries + 1):
-        # Clear any stale UI storage and bounce off 404 if present
-        clear_web_storage()
-        if return_to_account_if_404():
-            time.sleep(1.0)
-
-        # Always attempt the official URL first (Citi often needs 2 hits)
-        try:
-            robust_get(OFFERS_URL, tries=2)
-        except Exception as exc:
-            sheet_log("WARN", "nav", f"direct offers get failed (try {attempt}): {exc}")
-
-        try:
-            WebDriverWait(driver, 12).until(
-                lambda _: offers_ready() or error_banner_visible() or error_toast_visible() or page_not_found_visible()
-            )
-        except Exception:
-            pass
-
-        if on_offers():
-            sheet_log("INFO", "nav", f"offers ready (direct, try {attempt})")
-            return True
-
-        # If still not there, drive via in-site menu to maintain app context
-        used_menu = False
-        if NAV_MENU_FALLBACK:
-            if nav_via_rewards_menu():
-                used_menu = True
-                try:
-                    WebDriverWait(driver, 12).until(
-                        lambda _: offers_ready() or error_banner_visible() or error_toast_visible()
-                    )
-                except Exception:
-                    pass
-                if on_offers():
-                    sheet_log("INFO", "nav", f"offers ready (menu, try {attempt})")
-                    return True
-
-        # Stronger recovery on later attempts: visit Home then back to Offers
-        if attempt >= 3:
-            go_home_then_back()
-            if on_offers():
-                sheet_log("INFO", "nav", f"offers ready (home-bridge, try {attempt})")
-                return True
-
-        # If we got a 404 page again, click Return and try loop again
-        if page_not_found_visible():
-            if return_to_account_if_404():
-                sheet_log("WARN", "nav", f"404 healed, retrying ({attempt}/{max_tries})")
-                time.sleep(1.0)
-                continue
-
-        # Try a gentle refresh as a last nudge this attempt
-        driver.refresh()
-        time.sleep(PAGE_LOAD_PAUSE)
-        if on_offers():
-            src = "menu" if used_menu else "refresh"
-            sheet_log("INFO", "nav", f"offers ready ({src}, try {attempt})")
-            return True
-
-        sheet_log("WARN", "nav", f"offers not ready – retrying ({attempt}/{max_tries})")
-        time.sleep(1.0)
-
-    sheet_log("ERROR", "nav", "could not reach merchant offers after login")
+        sheet_log("WARN", "nav", f"robust_get failed: {last_exc}")
     return False
 
+def on_dashboard() -> bool:
+    u = driver.current_url or ""
+    return u.startswith(CHASE_POST_LOGIN)
 
-print("Function 'goto_offers_page' loaded – hardened navigation ready.")
-
-print("Section 'page helpers' complete – detection and healing enabled.")
-
-
-# ---------------------------------------------------------------------------
-# Section: login
-# ---------------------------------------------------------------------------
-
-# Robust login flow using classic page first and fallbacks
-
-def _type_or_js(el, text: str):
-    """Enter text reliably, fallback to JS value-set if needed."""
+def type_like_human(el, text: str, total_seconds: float = 2.0):
+    """Click then type one char at a time over ~total_seconds."""
     try:
-        el.clear()
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
     except Exception:
         pass
     try:
         el.click()
     except Exception:
         pass
-    el.send_keys(text)
-    val = (el.get_attribute("value") or "").strip()
-    if val != text:
-        driver.execute_script(
-            "arguments[0].value = arguments[1];"
-            "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
-            "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
-            el, text
-        )
+    delay = max(0.03, total_seconds / max(1, len(text)))
+    for ch in text:
+        el.send_keys(ch)
+        time.sleep(delay)
 
-
-print("Function '_type_or_js' loaded – resilient typing enabled.")
-
-
-def _find_input_any(selectors: List[Tuple[str, str]], timeout: int = 20):
-    """Find a visible, enabled element in DOM or first-level iframes."""
-    end = time.time() + timeout
-    while time.time() < end:
-        for by, val in selectors:
-            try:
-                el = driver.find_element(by, val)
-                if el.is_displayed() and el.is_enabled():
-                    return el
-            except Exception:
-                pass
-        frames = driver.find_elements(By.TAG_NAME, "iframe")
-        for f in frames:
-            try:
-                driver.switch_to.frame(f)
-                for by, val in selectors:
-                    try:
-                        el = driver.find_element(by, val)
-                        if el.is_displayed() and el.is_enabled():
-                            driver.switch_to.default_content()
-                            driver.switch_to.frame(f)
-                            return el
-                    except Exception:
-                        pass
-            finally:
-                driver.switch_to.default_content()
-        time.sleep(0.2)
-    raise TimeoutException("Login element not found")
-
-
-print("Function '_find_input_any' loaded – login element finder ready.")
-
-
-def ensure_login_context(pre_wait: int = 3, max_wait: int = 20) -> None:
-    """Prefer the classic login page; bounce via OFFERS_URL if necessary."""
-    driver.switch_to.default_content()
-    driver.get(LOGIN_URL)
-    time.sleep(pre_wait)
-    try:
-        WebDriverWait(driver, max_wait).until(
-            EC.presence_of_element_located((By.ID, "username"))
-        )
-        return
-    except Exception:
-        pass
-    driver.get(OFFERS_URL)
-    time.sleep(2)
-    click_no_thanks_if_present(4)
-    driver.get(LOGIN_URL)
-    time.sleep(pre_wait)
-
-
-print("Function 'ensure_login_context' loaded – classic login preference set.")
-
-
-def login_once(username: str, password: str, pause: float) -> None:
-    """Single login attempt with adjustable typing cadence."""
-    user_el = _find_input_any([
-        (By.ID, "username"),
-        (By.NAME, "username"),
-        (By.ID, "userId"),
+# -------------------------------
+# Login + 2FA handling
+# -------------------------------
+def prefill_home_login(username: str, password: str):
+    """Prefill user + pass on the chase.com home login widget."""
+    # Username
+    for by, val in [
+        (By.ID, "userId-text-input-field"),
+        (By.CSS_SELECTOR, "input[data-validate='userId']"),
         (By.NAME, "userId"),
-        (By.CSS_SELECTOR, "input[placeholder*='User'][type='text']")
-    ], timeout=25)
-    _type_or_js(user_el, username)
-    time.sleep(max(0.1, pause))
-
-    try:
-        wrap = driver.find_element(
-            By.XPATH,
-            "//input[@id='password' or @name='password' or @id='citi-input2-0' or @id='pwd']"
-            "/ancestor::*[contains(@class,'input-switch-wrapper')]"
-        )
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", wrap)
-        wrap.click()
-        time.sleep(0.2)
-    except Exception:
-        pass
-
-    pass_el = _find_input_any([
-        (By.ID, "password"),
-        (By.NAME, "password"),
-        (By.ID, "pwd"),
-        (By.CSS_SELECTOR, "input[type='password']"),
-        (By.ID, "citi-input2-0"),
-    ], timeout=25)
-    _type_or_js(pass_el, password)
-    time.sleep(max(0.1, pause))
-
-    try:
-        btn = _find_input_any([
-            (By.XPATH,
-             "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'sign on')]"),
-            (By.CSS_SELECTOR, "button[type='submit']")
-        ], timeout=25)
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-        driver.execute_script("arguments[0].click();", btn)
-    except TimeoutException:
-        pass_el.send_keys(Keys.ENTER)
-
-
-print("Function 'login_once' loaded – single-attempt login ready.")
-
-def citi_login(username: str, password: str) -> bool:
-    """Resilient login loop with multiple speeds and pop-up handling."""
-    ensure_login_context(pre_wait=3, max_wait=20)
-    for attempt, pause in enumerate((0.1, 0.5, 1.0), start=1):
-        login_once(username, password, pause)
+        (By.XPATH, "//input[@data-validate='userId' or @id='userId-text-input-field']"),
+    ]:
         try:
-            WebDriverWait(driver, 12).until(lambda _: logged_in() or "login" in driver.current_url)
+            el = driver.find_element(by, val)
+            if el.is_displayed():
+                try: el.clear()
+                except: pass
+                type_like_human(el, username, total_seconds=1.5)
+                # Nudge framework to register value
+                driver.execute_script(
+                    "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+                    "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", el)
+                print("[login] Username typed.")
+                break
         except Exception:
             pass
-        click_no_thanks_if_present(4)
-        if logged_in():
-            sheet_log("INFO", "login", f"{username} success (try {attempt})")
-            return True
-        time.sleep(2.0)
-    sheet_log("ERROR", "login", f"{username} failed after retries on URL {driver.current_url}")
-    return False
 
+    # Password
+    for by, val in [
+        (By.ID, "password-text-input-field"),
+        (By.NAME, "password"),
+        (By.CSS_SELECTOR, "input[type='password'][name='password']"),
+        (By.XPATH, "//input[@id='password-text-input-field' or @name='password']"),
+    ]:
+        try:
+            el = driver.find_element(by, val)
+            if el.is_displayed():
+                try: el.clear()
+                except: pass
+                type_like_human(el, password, total_seconds=2.0)
+                driver.execute_script(
+                    "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+                    "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));", el)
+                print("[login] Password typed.")
+                break
+        except Exception:
+            pass
 
-print("Function 'citi_login' loaded – resilient login flow ready.")
+def maybe_fill_password_on_2fa(password: str):
+    """
+    If we land on the 'recognizeUser/provideAuthenticationCode' page,
+    click the password container first, then type the password ONCE.
+    Retries at most every 6s if it didn't stick.
+    """
+    global _TWOFA_PASSWORD_DONE, _TWOFA_LAST_ATTEMPT
 
-def citi_logout() -> None:
-    """Log out and clear cookies to isolate sessions."""
+    u = driver.current_url or ""
+    if CHASE_2FA_FRAGMENT not in u:
+        return
+    if _TWOFA_PASSWORD_DONE:
+        return
+
+    now = time.time()
+    if now - _TWOFA_LAST_ATTEMPT < 6.0:
+        return
+    _TWOFA_LAST_ATTEMPT = now
+
     try:
-        driver.get("https://online.citi.com/US/logout")
-        time.sleep(3)
-        driver.delete_all_cookies()
-        clear_web_storage()
-        sheet_log("INFO", "logout", "success")
-    except Exception as exc:
-        sheet_log("WARN", "logout", str(exc))
-
-
-print("Function 'citi_logout' loaded – logout routine ready.")
-
-print("Section 'login' complete – login and logout helpers ready.")
-
-# ---------------------------------------------------------------------------
-# Section: offer scraping
-# ---------------------------------------------------------------------------
-
-# Expand lists, parse offer details, and append rows to the sheet
-
-def plus_icons():
-    """Return enroll icons for unenrolled offers."""
-    return driver.find_elements(By.XPATH, "//cds-icon[@name='plus-circle' and @arialabel='Enroll']")
-
-
-print("Function 'plus_icons' loaded – enroll icon locator ready.")
-
-def expand_all():
-    """Click any 'Show more'/'Load more' buttons until all offers are visible."""
-    while True:
-        btns = [b for b in driver.find_elements(
-            By.XPATH,
-            "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more') "
-            "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'load more')]"
-        ) if b.is_displayed()]
-        if not btns:
-            break
-        for btn in btns:
+        # Click the outer container first to mimic a human focus action
+        try:
+            container = driver.find_element(By.ID, "password_input")
             try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                driver.execute_script("arguments[0].click();", btn)
-                time.sleep(0.3)
-            except Exception as exc:
-                sheet_log("ERROR", "expand", str(exc))
-        time.sleep(0.3)
-    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'offer-tile')]")))
-
-
-print("Function 'expand_all' loaded – offer list expander ready.")
-
-def close_modal():
-    """Close the offer details modal dialog."""
-    sels = [
-        "//button[contains(text(),'Close')]",
-        "//button[@aria-label='Close']",
-        "//button[contains(@class,'cds-modal-close')]",
-        "//cds-icon/ancestor::button",
-    ]
-    for sel in sels:
-        els = driver.find_elements(By.XPATH, sel)
-        if els:
-            try:
-                driver.execute_script("arguments[0].click();", els[0])
-                WebDriverWait(driver, 10).until(EC.invisibility_of_element_located(
-                    (By.CSS_SELECTOR, ".mo-modal-img-merchant-name")))
-                return
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", container)
             except Exception:
                 pass
-    driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-    WebDriverWait(driver, 10).until(EC.invisibility_of_element_located(
-        (By.CSS_SELECTOR, ".mo-modal-img-merchant-name")))
+            try:
+                container.click()
+                time.sleep(0.15)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
+        # Now target the actual input
+        el = driver.find_element(By.ID, "password_input-input-field")
+        existing = (el.get_attribute("value") or "").strip()
+        if existing:
+            _TWOFA_PASSWORD_DONE = True
+            return
 
-print("Function 'close_modal' loaded – modal closer ready.")
+        try:
+            el.clear()
+        except Exception:
+            pass
 
+        # Type like a human over ~2 seconds
+        type_like_human(el, password, total_seconds=2.0)
+
+        # Fire input/change events to satisfy client-side validation
+        try:
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+                "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                el
+            )
+        except Exception:
+            pass
+
+        # Confirm it stuck
+        if (el.get_attribute("value") or "").strip():
+            _TWOFA_PASSWORD_DONE = True
+            print("[2FA] Password filled on recognizeUser page.")
+        else:
+            print("[2FA] Password did not stick; will retry later.")
+
+    except Exception as e:
+        print(f"[2FA] Could not fill password: {type(e).__name__}")
+
+def wait_for_post_login(timeout: int = LOGIN_WAIT_MAX) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if on_dashboard():
+            print(f"[login] Post-login detected: {driver.current_url}")
+            return True
+        maybe_fill_password_on_2fa(P1)
+        time.sleep(0.5)
+    sheet_log("ERROR", "wait", "Timed out waiting for post-login.")
+    return False
+
+# -------------------------------
+# Offer-page DOM helpers
+# -------------------------------
+def hub_shell_present() -> bool:
+    sels = [
+        "//button[@id='select-select-credit-card-account' or @id='select-credit-card-account']",
+        "//*[@data-testid='select-credit-card-account' or @id='select-credit-card-account']",
+        "//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'chase offers')]",
+    ]
+    for xp in sels:
+        if driver.find_elements(By.XPATH, xp):
+            return True
+    return False
+
+def categories_shell_present() -> bool:
+    sels = [
+        "//*[@data-testid='offerCategoriesPage']",
+        "//h1[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'offers for you')]",
+        "//div[contains(@class,'offer') and .//button[contains(@aria-label,'Add') or contains(.,'Add')]]",
+        "//*[@data-testid='loading-indicator' or contains(@class,'skeleton')]",
+    ]
+    for xp in sels:
+        if driver.find_elements(By.XPATH, xp):
+            return True
+    return False
+
+def add_buttons_present() -> bool:
+    sels = [
+        "button[aria-label*='Add offer']",
+        "[data-testid='addOfferButton']",
+        "mds-icon[data-testid='commerce-tile-button']",
+        "button[aria-label^='Add ']",
+        "//button[contains(.,'Add') and not(@disabled)]",
+    ]
+    for sel in sels:
+        try:
+            if sel.startswith("//"):
+                if driver.find_elements(By.XPATH, sel):
+                    return True
+            else:
+                if driver.find_elements(By.CSS_SELECTOR, sel):
+                    return True
+        except Exception:
+            pass
+    return False
+
+# -------------------------------
+# Parsing helpers
+# -------------------------------
+BRAND_FALLBACK = "Unknown Brand"
+CARD_NAME_DEFAULT = "Chase Card"
 
 def try_parse_date_any(s: str) -> Optional[date]:
-    """Parse flexible date formats used by offers."""
-    if not s:
-        return None
+    if not s: return None
     s = s.strip()
-    for fmt in ("%b %d, %Y", "%B %d, %Y", "%b %d,%Y", "%B %d,%Y"):
+    for fmt in ("%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(s, fmt).date()
         except Exception:
             pass
-    m = re.match(r"^\s*(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\s*$", s)
+    m = re.search(r"(\d+)\s+days", s, re.I)
     if m:
-        mm, dd, yy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if yy < 100:
-            yy += 2000
         try:
-            return date(yy, mm, dd)
+            return (datetime.today() + timedelta(days=int(m.group(1)))).date()
         except Exception:
             return None
     return None
 
+def normalize_date_out(s: Optional[str]) -> str:
+    d = try_parse_date_any(s or "")
+    return d.strftime("%b %d, %Y") if d else ""
 
-print("Function 'try_parse_date_any' loaded – flexible date parser ready.")
+def parse_discount_from_sources(*texts: str) -> str:
+    pat = re.compile(
+        r"(\$\d[\d,]*(?:\.\d{2})?\s*(?:cash\s*)?back|\$\d[\d,]*(?:\.\d{2})?\s*off|\d{1,3}%\s*(?:cash\s*)?back|\d{1,3}%\s*off)",
+        re.I
+    )
+    for t in texts:
+        if not t: continue
+        m = pat.search(t)
+        if m: return m.group(1).strip()
+    return ""
 
+def parse_card_and_last4_quick() -> Tuple[str, str]:
+    try:
+        el = driver.find_element(By.XPATH, "//span[starts-with(normalize-space(),'Pay with ')]")
+        txt = el.text.strip()
+        m = re.search(r"^Pay with\s+(.*?)\s*\((?:\.\.\.)?(\d{4})\)", txt)
+        if m:
+            return m.group(1).strip() + " Card", m.group(2)
+    except Exception:
+        pass
+    body = ""
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text
+    except Exception:
+        pass
+    m2 = re.search(r"(?:ending in|ending\s*\*)\s*(\d{4})", body, re.I)
+    if m2:
+        return CARD_NAME_DEFAULT, m2.group(1)
+    m3 = re.search(r"\(\.\.\.(\d{4})\)", body)
+    if m3:
+        return CARD_NAME_DEFAULT, m3.group(1)
+    return CARD_NAME_DEFAULT, "XXXX"
 
-def normalize_expiration_string(s: str) -> str:
-    """Normalize expiration dates to 'Mon DD, YYYY'."""
-    d = try_parse_date_any(s)
-    return d.strftime("%b %d, %Y") if d else s
-
-
-print("Function 'normalize_expiration_string' loaded – date normalizer ready.")
-
-def parse_max_disc(text: str) -> Optional[str]:
-    """Extract 'Max $X' values if present."""
-    m = re.search(r"[Mm]ax[^$]{0,25}\$(\d[\d,]*)", text)
-    return f"${m.group(1)}" if m else None
-
-
-print("Function 'parse_max_disc' loaded – max discount parser ready.")
-
-def parse_min_spend(text: str) -> Optional[str]:
-    """Extract 'spend $X' or 'purchase $X' minimums if present."""
-    m = re.search(r"(?:purchase|spend)[^$]{0,25}\$(\d[\d,]*)", text, re.I)
-    return f"${m.group(1)}" if m else None
-
-
-print("Function 'parse_min_spend' loaded – minimum spend parser ready.")
-
-CARD_LABEL_CSS = "div#cds-dropdown-button-value.cds-dd2-pseudo-value"
-BTN_DROPD_X = ("//button[@id='cds-dropdown' and contains(@class,'cds-dd2-button')]")
-OPT_DROPD_X = ("//ul[@id='cds-dropdown-listbox']/li[not(contains(@class,'disabled'))]")
-
-def open_card_dropdown() -> None:
-    """Open the card selector dropdown."""
-    wait.until(EC.element_to_be_clickable((By.XPATH, BTN_DROPD_X))).click()
-
-
-print("Function 'open_card_dropdown' loaded – card selector opener ready.")
-
-def get_label():
-    """Return the current card label node."""
-    return wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, CARD_LABEL_CSS)))
-
-
-print("Function 'get_label' loaded – card label getter ready.")
-
-
-def heal_offers_page(label_to_reselect: Optional[str] = None, tries: int = 3) -> bool:
-    """Heal common offers load hiccups by tab toggles and refresh."""
-    for _ in range(tries):
-        if offers_ready() and not error_toast_visible():
-            return True
-        for tab_text in ("Enrolled", "All"):
+def read_detail_text_quick(max_chars: int = 6000) -> str:
+    sels = [
+        "//*[@data-testid='offer-detail-text-and-disclaimer-link-container-id']",
+        "//*[@data-cy='offer-detail-text-and-disclaimer-link-container']",
+    ]
+    for xp in sels:
+        els = driver.find_elements(By.XPATH, xp)
+        if els:
             try:
-                tab = driver.find_element(By.XPATH, f"//a[normalize-space()='{tab_text}']")
-                driver.execute_script("arguments[0].click();", tab)
-                time.sleep(0.8)
+                txt = "\n".join(e.text for e in els if e.text.strip())
+                return txt[:max_chars]
             except Exception:
                 pass
-        if offers_ready() and not error_toast_visible():
-            return True
-        driver.refresh()
-        time.sleep(1.5)
-        if label_to_reselect:
-            try:
-                open_card_dropdown()
-                wait.until(EC.element_to_be_clickable(
-                    (By.XPATH, f"{OPT_DROPD_X}[normalize-space()='{label_to_reselect}']"))).click()
-                WebDriverWait(driver, 8).until(lambda _: get_label().text.strip() == label_to_reselect)
-            except Exception:
-                pass
+    try:
+        return driver.find_element(By.TAG_NAME, "body").text[:max_chars]
+    except Exception:
+        return ""
+
+def read_offer_header_quick() -> Tuple[str, str]:
+    disc = ""
+    limit = ""
+    try:
+        amt = driver.find_elements(By.CSS_SELECTOR, "[data-testid='offerAmount']")
+        if amt and amt[0].text.strip():
+            disc = amt[0].text.strip()
+    except Exception:
+        pass
+    try:
+        lim = driver.find_elements(By.CSS_SELECTOR, "[data-testid='limitations']")
+        if lim and lim[0].text.strip():
+            limit = lim[0].text.strip()
+    except Exception:
+        pass
+    return disc, limit
+
+def parse_limits_local_expiration(terms_text: str, hdr_limit: str = "") -> Tuple[str, str, str, str]:
+    maxd = ""
+    m = re.search(r"\$\s?([\d,]+(?:\.\d{2})?)\s*(?:cash\s*back\s*)?(?:maximum|max)\b", terms_text, re.I)
+    if m: maxd = f"${m.group(1)}"
+    if not maxd:
+        m = re.search(r"[Mm]ax(?:imum)?[^$]{0,25}\$(\d[\d,]*(?:\.\d{2})?)", terms_text)
+        if m: maxd = f"${m.group(1)}"
+
+    mind = ""
+    m = re.search(r"(?:spend|purchase)[^$]{0,25}\$(\d[\d,]*(?:\.\d{2})?)", terms_text, re.I)
+    if m: mind = f"${m.group(1)}"
+    if not mind and hdr_limit:
+        m2 = re.search(r"\$(\d[\d,]*(?:\.\d{2})?)", hdr_limit)
+        if m2: mind = f"${m2.group(1)}"
+
+    exp = ""
+    m = re.search(r"(?:Expires?|Offer expires|Exp\.)\s*(?:on\s*)?([A-Za-z]{3,9}\s+\d{1,2},\s*\d{2,4}|\d{1,2}/\d{1,2}/\d{2,4})", terms_text, re.I)
+    if m: exp = normalize_date_out(m.group(1))
+    else:
+        m2 = re.search(r"expires?\s+in\s+\d+\s+days", terms_text, re.I)
+        if m2: exp = normalize_date_out(m2.group(0))
+
+    local = "Yes" if re.search(r"Offer only applies to the following location", terms_text, re.I) else "No"
+    if local == "No" and re.search(r"\n\d{2,5}\s+.+\n[A-Za-z\s]+,\s*[A-Z]{2}\s+\d{5}", terms_text):
+        local = "Yes"
+
+    return maxd, (mind or "None"), exp, local
+
+def extract_brand_smart(tile_guess: str = "") -> str:
+    try:
+        js = """
+        const added = Array.from(document.querySelectorAll('*'))
+          .find(e => /added to card/i.test(e.textContent||''));
+        if (added) {
+            let p = added.previousElementSibling;
+            while (p) {
+                const t = (p.innerText||'').trim();
+                if (t && t.length <= 80) return t;
+                p = p.previousElementSibling;
+            }
+        }
+        return '';
+        """
+        val = driver.execute_script(js) or ""
+        if val and not re.search(r"cash\\s*back|\\$\\d", val, re.I):
+            return val.strip()
+    except Exception:
+        pass
+    for sel in ("[data-testid='merchantName']","[data-testid='brandName']","div[class*='merchant'] span","div[class*='brand'] span"):
         try:
-            WebDriverWait(driver, 10).until(lambda _: offers_ready() or error_toast_visible())
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            if els and els[0].text.strip():
+                txt = els[0].text.strip()
+                if not re.search(r"cash\s*back|\$\d", txt, re.I):
+                    return txt
         except Exception:
             pass
-        if offers_ready() and not error_toast_visible():
+    try:
+        heads = driver.find_elements(By.XPATH, "//*[self::h1 or self::h2 or self::h3 or @role='heading']")
+        for h in heads[:6]:
+            txt = (h.text or "").strip()
+            if txt and not re.search(r"cash\s*back|\$\d|about this deal", txt, re.I) and 2 <= len(txt) <= 60:
+                return txt
+    except Exception:
+        pass
+    return tile_guess.strip() or BRAND_FALLBACK
+
+# -------------------------------
+# Offer actions
+# -------------------------------
+def find_add_buttons() -> list:
+    sels = [
+        "button[aria-label*='Add offer']",
+        "[data-testid='addOfferButton']",
+        "mds-icon[data-testid='commerce-tile-button']",
+        "button[aria-label^='Add ']"
+    ]
+    found = []
+    for sel in sels:
+        try:
+            found.extend(driver.find_elements(By.CSS_SELECTOR, sel))
+        except Exception:
+            pass
+    # Prefer visible ones
+    return [b for b in found if b.is_displayed()]
+
+def click_add_target(el) -> bool:
+    try:
+        node = el
+        for _ in range(5):
+            if node.tag_name.lower() == "button" or node.get_attribute("role") == "button":
+                break
+            node = node.find_element(By.XPATH, "./..")
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", node)
+        time.sleep(FAST_CLICK_DELAY)
+        driver.execute_script("arguments[0].click();", node)
+        return True
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", el)
             return True
-    return False
-
-
-print("Function 'heal_offers_page' loaded – offers self-heal ready.")
-
-
-def scrape_card(label: str, holder: str, seen: Set[Tuple]) -> bool:
-    """Enroll all visible offers for a given card and capture details."""
-    if get_label().text.strip() != label:
-        open_card_dropdown()
-        wait.until(EC.element_to_be_clickable((By.XPATH, f"{OPT_DROPD_X}[normalize-space()='{label}']"))).click()
-        WebDriverWait(driver, 10).until(lambda _: get_label().text.strip() == label)
-
-    if not heal_offers_page(label):
-        sheet_log("WARN", "card", f"{label}: could not load offers after retries – aborting account")
-        return False
-
-    card, last4 = [s.strip() for s in label.rsplit("-", 1)]
-
-    try:
-        driver.execute_script("window.scrollTo(0,0);")
-        expand_all()
-    except TimeoutException:
-        if not heal_offers_page(label):
-            sheet_log("WARN", "card", f"{label}: offers never loaded – aborting account")
+        except Exception:
             return False
-        driver.execute_script("window.scrollTo(0,0);")
-        expand_all()
 
-    new_rows: List[List[str]] = []
+def close_enroll_error_if_present():
     try:
-        while (icons := plus_icons()):
-            ico = icons[0]
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", ico)
-            driver.execute_script("arguments[0].click();", ico)
-            WebDriverWait(driver, 8).until(lambda _:
-                                           driver.find_elements(By.XPATH, "//div[contains(@class,'enrolled')]") or
-                                           driver.find_elements(By.CSS_SELECTOR, ".mo-modal-img-merchant-name"))
+        xp = ("//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+              "'unable to enroll merchant offer')]/ancestor::*[@role='dialog' or contains(@class,'modal')]")
+        modals = driver.find_elements(By.XPATH, xp)
+        for m in modals:
+            btns = m.find_elements(By.XPATH, ".//button[@aria-label='Close' or @aria-label='Dismiss' or contains(.,'Close') or .//cds-icon]")
+            if btns:
+                driver.execute_script("arguments[0].click();", btns[0])
+                time.sleep(0.25)
+    except Exception:
+        pass
 
-            brand = driver.find_element(By.CSS_SELECTOR, ".mo-modal-img-merchant-name").text.strip()
-            disc = driver.find_element(By.CSS_SELECTOR, ".mo-modal-offer-title div").text.strip()
-            body = driver.find_element(By.CSS_SELECTOR, "cds-column section").text
-            maxd  = parse_max_disc(body) or ""
-            mins  = parse_min_spend(body) or "None"
-            exp_raw = driver.find_element(By.CSS_SELECTOR, ".mo-modal-header-date span").text.strip()
-            exp = normalize_expiration_string(exp_raw)
-            local = "Yes" if "philadelphia" in body.lower() else "No"
-            added = datetime.today().strftime("%m/%d/%Y")
+def quick_back():
+    btns = driver.find_elements(By.CSS_SELECTOR, "[aria-label='Back']")
+    if btns:
+        try:
+            driver.execute_script("arguments[0].click();", btns[0])
+            time.sleep(FAST_BACK_WAIT)
+            return
+        except Exception:
+            pass
+    driver.execute_script("window.history.back();")
+    time.sleep(FAST_BACK_WAIT)
 
-            row = (holder, last4, card, brand, disc, maxd, mins, added, exp, local)
-            if row not in seen:
-                new_rows.append(list(row))
-                seen.add(row)
+def tile_fingerprint(tile) -> str:
+    try:
+        txt = (tile.text or "").strip()
+        txt = re.sub(r"\s+", " ", txt)[:200]
+        return txt
+    except Exception:
+        return str(time.time())
 
-            close_modal()
-            time.sleep(0.25)
-    finally:
-        if new_rows:
+def expand_all_offers_if_present():
+    # Click "Show more / Load more / See all offers" once if present
+    for xp in (
+        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'show more')]",
+        "//button[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'load more')]",
+        "//a[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'see all offers')]",
+    ):
+        try:
+            btns = [b for b in driver.find_elements(By.XPATH, xp) if b.is_displayed()]
+            if btns:
+                driver.execute_script("arguments[0].click();", btns[0])
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+def gentle_scroll_through():
+    # helps lazy-load tiles
+    try:
+        h = driver.execute_script("return document.body.scrollHeight || document.documentElement.scrollHeight;")
+        for y in range(0, int(h), 500):
+            driver.execute_script("window.scrollTo(0, arguments[0]);", y)
+            time.sleep(0.12)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(0.15)
+    except Exception:
+        pass
+
+def enroll_all_offers_for_current_card(existing_rows: Set[Tuple[str,...]]) -> int:
+    global APPEND_BUFFER, CURRENT_CARD_BUFFER
+    CURRENT_CARD_BUFFER = []
+    per_card_rows: List[List[str]] = []
+    per_card_keys: Set[tuple] = set()
+    processed_fps: Set[str] = set()
+    added_total = 0
+
+    expand_all_offers_if_present()
+    gentle_scroll_through()
+
+    # Give tiles a moment to appear
+    t0 = time.time()
+    while time.time() - t0 < 12.0:
+        if add_buttons_present():
+            break
+        time.sleep(0.2)
+
+    idle_cycles = 0
+    safety_clicks = 0
+    print(f"[offers] starting scan...")
+
+    while True:
+        buttons = find_add_buttons()
+        picked = None
+        picked_tile = None
+        picked_fp = None
+
+        for btn in buttons:
             try:
-                OFFER_WS.append_rows(new_rows, value_input_option="RAW", insert_data_option="INSERT_ROWS")
-                # --- NEW: refresh header filter after each batch append ---
-                try:
-                    reset_filters_full_range()
-                except Exception as exc2:
-                    sheet_log("WARN", "filters", f"refresh after append failed: {exc2}")
-                # ---------------------------------------------------------
-            except Exception as exc:
-                sheet_log("ERROR", "append_rows", str(exc))
+                # parent tile
+                t = btn.find_element(By.XPATH, "./ancestor::*[self::div][1]")
+                fp = tile_fingerprint(t)
+                if fp in processed_fps:
+                    # hide to avoid reprocessing
+                    try: driver.execute_script("arguments[0].style.display='none';", btn)
+                    except Exception: pass
+                    continue
+                picked = btn
+                picked_tile = t
+                picked_fp = fp
+                break
+            except Exception:
+                continue
 
-    return True
+        if not picked:
+            idle_cycles += 1
+            if idle_cycles >= 3:
+                break
+            time.sleep(0.3)
+            continue
 
-
-print("Function 'scrape_card' loaded – per-card enrollment and capture ready.")
-
-
-def scrape_account(acct: dict) -> None:
-    """Login, reach offers, iterate cards, and logout."""
-    user, pwd, holder = acct["user"], acct["pass"], acct["holder"]
-    if not citi_login(user, pwd):
-        return
-    if not goto_offers_page():
-        citi_logout()
-        return
-
-    seen = {tuple(r) for r in OFFER_WS.get_all_values()[1:]}
-    open_card_dropdown()
-    labels = [li.text.strip() for li in driver.find_elements(By.XPATH, OPT_DROPD_X)
-              if li.text.strip() and li.text.strip().lower() != "credit"]
-    driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-
-    for lab in labels:
-        ok = scrape_card(lab, holder, seen)
-        if not ok:
+        idle_cycles = 0
+        safety_clicks += 1
+        if safety_clicks > 200:
+            print("[offers] safety stop: too many clicks.")
             break
 
-    citi_logout()
+        tile_text = (picked_tile.text or "")
+        # Brand guess from tile
+        tile_brand_guess = ""
+        try:
+            for sel in (".//h3", ".//h2", ".//div[@role='heading']"):
+                els = picked_tile.find_elements(By.XPATH, sel)
+                if els and els[0].text.strip():
+                    tile_brand_guess = els[0].text.strip()
+                    break
+        except Exception:
+            pass
+        disc_tile = parse_discount_from_sources(tile_text)
 
+        if not click_add_target(picked):
+            # if can't click, mark processed to avoid loop
+            processed_fps.add(picked_fp)
+            try: driver.execute_script("arguments[0].style.display='none';", picked)
+            except Exception: pass
+            continue
 
-print("Function 'scrape_account' loaded – account-level workflow ready.")
+        # Wait briefly for detail OR immediate "Added" state
+        t1 = time.time()
+        navigated = False
+        while time.time() - t1 < 2.0:
+            if driver.find_elements(By.XPATH, "//span[starts-with(normalize-space(),'Pay with ')]"):
+                navigated = True
+                break
+            # or tile might change in place; short pause
+            time.sleep(0.1)
 
-print("Section 'offer scraping' complete – enrollment and capture ready.")
+        close_enroll_error_if_present()
 
-# ---------------------------------------------------------------------------
-# Section: sheet maintenance
-# ---------------------------------------------------------------------------
+        if navigated:
+            # parse detail page
+            header_disc, header_lim = read_offer_header_quick()
+            card_name, last4 = parse_card_and_last4_quick()
+            terms = read_detail_text_quick()
+            maxd, mind, exp_norm, local = parse_limits_local_expiration(terms, hdr_limit=header_lim)
+            discount = (parse_discount_from_sources(header_disc, disc_tile, terms, tile_text)
+                        or header_disc or disc_tile or "Unknown")
+            brand = extract_brand_smart(tile_brand_guess)
+            row = [HOLDER, last4, card_name, brand, discount, maxd, mind,
+                   datetime.today().strftime("%b %d, %Y"), exp_norm, local]
+            key = tuple(row)
+            if key not in existing_rows and key not in per_card_keys:
+                per_card_rows.append(row); CURRENT_CARD_BUFFER.append(row)
+                per_card_keys.add(key); existing_rows.add(key); added_total += 1
+            quick_back()
+            time.sleep(FAST_BETWEEN)
+        else:
+            # tile-only add; record minimal info using tile text
+            card_name, last4 = CARD_NAME_DEFAULT, "XXXX"
+            discount = disc_tile or "Unknown"
+            brand = tile_brand_guess or extract_brand_smart(tile_brand_guess)
+            maxd = mind = exp = ""; local = "No"
+            row = [HOLDER, last4, card_name, brand, discount, maxd, (mind or "None"),
+                   datetime.today().strftime("%b %d, %Y"), exp, local]
+            key = tuple(row)
+            if key not in existing_rows and key not in per_card_keys:
+                per_card_rows.append(row); CURRENT_CARD_BUFFER.append(row)
+                per_card_keys.add(key); existing_rows.add(key); added_total += 1
 
-# Remove expired offers, dedupe rows, and reset filters
+        processed_fps.add(picked_fp)
 
-def try_parse_date_any_for_expiration(s: str) -> Optional[date]:
-    """Wrapper for expiration column parsing with safety."""
+    if per_card_rows:
+        try:
+            OFFER_WS.append_rows(per_card_rows, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+            CURRENT_CARD_BUFFER = []
+            print(f"[offers] appended {len(per_card_rows)} row(s).")
+            reset_filters_full_range()
+        except Exception as exc:
+            APPEND_BUFFER.extend(per_card_rows)
+            print(f"[offers] append failed; buffered {len(per_card_rows)} row(s): {exc}")
+
+    print(f"[offers] done – {added_total} new row(s).")
+    return added_total
+
+# -------------------------------
+# Card selection & navigation
+# -------------------------------
+def open_hub() -> bool:
+    if not robust_get(CHASE_OFFER_HUB, tries=2):
+        print("[hub] nav failed.")
+        return False
+    t0 = time.time()
+    while time.time() - t0 < 8.0:
+        if hub_shell_present():
+            print("[hub] shell detected.")
+            return True
+        time.sleep(0.2)
+    print("[hub] shell not detected.")
+    return False
+
+def select_account_by_id(acc_id: str) -> bool:
+    print(f"[acct] selecting {acc_id}")
     try:
-        return try_parse_date_any(s)
-    except Exception:
-        return None
+        trig = driver.find_elements(By.XPATH, "//button[@id='select-select-credit-card-account']")
+        if trig:
+            driver.execute_script("arguments[0].click();", trig[0])
+        else:
+            btn = driver.find_elements(By.XPATH, "//*[@id='select-credit-card-account']")
+            if btn:
+                driver.execute_script("arguments[0].click();", btn[0])
+        time.sleep(0.25)
 
-
-def row_is_expired(row: List[str]) -> bool:
-    """Return True when the Expiration date is before today."""
-    try:
-        d = try_parse_date_any_for_expiration(row[8])
-        return bool(d and d < date.today())
-    except Exception:
+        js_click = """
+        const accId = arguments[0];
+        const opt = document.querySelector('mds-select#select-credit-card-account mds-select-option[value="'+accId+'"]');
+        if (!opt) return 'no-option';
+        const root = opt.shadowRoot; if (!root) return 'no-shadow';
+        const hit = root.querySelector('.option'); if (!hit) return 'no-hit';
+        hit.click(); return 'ok';
+        """
+        res = driver.execute_script(js_click, acc_id)
+        print(f"[acct] shadow click: {res}")
+        time.sleep(CARD_LOAD_PAUSE)
+        return res == "ok"
+    except Exception as exc:
+        print(f"[acct] error: {exc}")
         return False
 
+def go_to_categories_for(acc_id: str) -> bool:
+    if not open_hub():
+        return False
+    _ = select_account_by_id(acc_id)  # best effort
 
-print("Function 'row_is_expired' loaded – expiration detector ready.")
+    # Hash-only route change is more reliable in SPA:
+    hash_route = f"/dashboard/merchantOffers/offerCategoriesPage?accountId={acc_id}&offerCategoryName=ALL"
+    try:
+        driver.execute_script("window.location.hash = arguments[0];", hash_route)
+    except Exception:
+        pass
+    time.sleep(0.6)
 
+    # Wait until correct account + tiles present
+    t0 = time.time()
+    while time.time() - t0 < 12.0:
+        u = driver.current_url or ""
+        on_cat = ("/merchantOffers/offerCategoriesPage" in u) and (acc_id in u)
+        dom_ok = add_buttons_present() or categories_shell_present()
+        if on_cat and dom_ok:
+            time.sleep(0.3)
+            return True
+        time.sleep(0.2)
 
-def delete_expired_rows() -> None:
-    """Delete expired rows from the sheet."""
+    # Last nudge: click any categories link once
+    try:
+        link = driver.find_elements(By.XPATH, "//a[contains(@href,'offerCategoriesPage')]")
+        if link:
+            driver.execute_script("arguments[0].click();", link[0])
+            time.sleep(1.2)
+            t1 = time.time()
+            while time.time() - t1 < 6.0:
+                u = driver.current_url or ""
+                on_cat = ("/merchantOffers/offerCategoriesPage" in u) and (acc_id in u)
+                dom_ok = add_buttons_present() or categories_shell_present()
+                if on_cat and dom_ok:
+                    return True
+                time.sleep(0.2)
+    except Exception:
+        pass
+
+    print("[cat] categories not confirmed.")
+    return False
+
+# -------------------------------
+# Card loop
+# -------------------------------
+def process_cards():
+    existing_rows: Set[Tuple[str, ...]] = {tuple(r) for r in OFFER_WS.get_all_values()[1:]}
+    total_cards = 0
+    total_rows  = 0
+
+    for idx, acc_id in enumerate(ACCOUNT_IDS, start=1):
+        print(f"\n----- Card {idx}/{len(ACCOUNT_IDS)} – accountId={acc_id}")
+        try:
+            if not go_to_categories_for(acc_id):
+                print("[card] categories view not ready; skipping.")
+                total_cards += 1
+                continue
+
+            added = enroll_all_offers_for_current_card(existing_rows)
+            print(f"[card] {idx} -> {added} new row(s).")
+            total_rows += max(0, added)
+            total_cards += 1
+        except Exception as exc:
+            sheet_log("ERROR", "card", f"{acc_id}: {type(exc).__name__}: {exc}")
+            print(f"[card] error {acc_id}: {exc}")
+            continue
+
+        time.sleep(0.7)
+
+    print(f"[cards] complete – {total_cards} card(s), {total_rows} row(s).")
+
+# -------------------------------
+# Sheet maintenance
+# -------------------------------
+def normalize_sheet_dates():
     rows = OFFER_WS.get_all_values()
-    sid  = OFFER_WS._properties["sheetId"]
-    req  = []
-    for i in range(len(rows) - 1, 0, -1):
-        if row_is_expired(rows[i]):
-            req.append({"deleteRange": {"range": {"sheetId": sid, "startRowIndex": i, "endRowIndex": i + 1},
-                                        "shiftDimension": "ROWS"}})
-    if req:
-        OFFER_WS.spreadsheet.batch_update({"requests": req})
-        sheet_log("INFO", "cleanup", f"deleted {len(req)} expired row(s)")
+    updates = []
+    for i in range(1, len(rows)):
+        row = rows[i]
+        for col_idx in (7, 8):
+            raw = row[col_idx].strip() if col_idx < len(row) else ""
+            norm = normalize_date_out(raw) if raw else ""
+            if norm and norm != raw:
+                updates.append((i + 1, col_idx + 1, norm))
+    for (r, c, v) in updates:
+        OFFER_WS.update_cell(r, c, v)
+    print(f"[sheet] normalized {len(updates)} date cell(s).")
 
-
-print("Function 'delete_expired_rows' loaded – expiration cleanup ready.")
-
-def dedupe_rows() -> None:
-    """Remove duplicate rows while preserving first occurrence."""
+def dedupe_rows() -> int:
     rows = OFFER_WS.get_all_values()
-    seen = set()
-    sid  = OFFER_WS._properties["sheetId"]
-    req  = []
+    seen = set(); sid = OFFER_WS._properties["sheetId"]; req = []
     for i in range(len(rows) - 1, 0, -1):
         key = tuple(rows[i])
         if key in seen:
@@ -971,14 +906,10 @@ def dedupe_rows() -> None:
             seen.add(key)
     if req:
         OFFER_WS.spreadsheet.batch_update({"requests": req})
-        sheet_log("INFO", "dedupe", f"removed {len(req)} duplicate row(s)")
+    print(f"[sheet] deduped {len(req)} row(s).")
+    return len(req)
 
-
-print("Function 'dedupe_rows' loaded – duplicate removal ready.")
-
-
-def reset_filters_full_range() -> None:
-    """Re-apply filters to the full used range so dropdowns include new values."""
+def reset_filters_full_range():
     values = OFFER_WS.get_all_values()
     last_row = max(1, len(values))
     last_col = len(OFFER_HEADERS)
@@ -986,76 +917,80 @@ def reset_filters_full_range() -> None:
     SHEET.batch_update({"requests": [
         {"clearBasicFilter": {"sheetId": sid}},
         {"setBasicFilter": {"filter": {
-            "range": {
-                "sheetId": sid,
-                "startRowIndex": 0,
-                "endRowIndex": last_row,
-                "startColumnIndex": 0,
-                "endColumnIndex": last_col
-            }
+            "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": last_row, "startColumnIndex": 0, "endColumnIndex": last_col}
         }}}]})
-    sheet_log("INFO", "filters", f"basic filter reset for rows 1..{last_row}")
+    print(f"[sheet] filter 1..{last_row}.")
 
-
-print("Function 'reset_filters_full_range' loaded – filter reset ready.")
-
-print("Section 'sheet maintenance' complete – cleanup utilities ready.")
-
-# ---------------------------------------------------------------------------
-# Section: main & entrypoint
-# ---------------------------------------------------------------------------
-
-# Run accounts with driver isolation, then cleanup and finalize
+# -------------------------------
+# Main
+# -------------------------------
+def flush_buffer():
+    global APPEND_BUFFER, CURRENT_CARD_BUFFER
+    if CURRENT_CARD_BUFFER:
+        APPEND_BUFFER.extend(CURRENT_CARD_BUFFER)
+        CURRENT_CARD_BUFFER = []
+    if not APPEND_BUFFER:
+        print("[flush] nothing to append.")
+        return
+    total = 0
+    try:
+        for i in range(0, len(APPEND_BUFFER), APPEND_CHUNK_SIZE):
+            chunk = APPEND_BUFFER[i:i + APPEND_CHUNK_SIZE]
+            OFFER_WS.append_rows(chunk, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+            total += len(chunk)
+        print(f"[flush] appended {total} buffered row(s).")
+        reset_filters_full_range()
+    except Exception as exc:
+        print(f"[flush] error: {exc}")
+    finally:
+        APPEND_BUFFER = []
 
 def safe_quit():
-    """Attempt to close the browser without raising on invalid session."""
     try:
         driver.quit()
     except InvalidSessionIdException:
         pass
 
+def main():
+    try:
+        # 1) Home, prefill login
+        robust_get(CHASE_HOME_URL, tries=1)
+        prefill_home_login(U1, P1)
+        print("[login] Finish MFA in browser (I'll fill the extra password once on the code page if shown).")
 
-print("Function 'safe_quit' loaded – graceful driver shutdown ready.")
+        # 2) Wait until dashboard/overview shows up
+        if not wait_for_post_login(LOGIN_WAIT_MAX):
+            print("[main] Post-login not detected – aborting.")
+            return
 
-def main() -> None:
-    """Process accounts then perform sheet maintenance."""
-    ACCOUNTS.sort(key=lambda a: a["holder"] != "Andrew")
-    for i, acct in enumerate(ACCOUNTS, start=1):
-        sheet_log("INFO", "account", f"start {acct['holder']}")
-        try:
-            scrape_account(acct)
-        except Exception as exc:
-            sheet_log("ERROR", "account", f"{acct['holder']} aborted: {type(exc).__name__}: {exc}")
+        process_cards()
+
+        # 3) Process cards
+        process_cards()
+
+        # 4) Sheet maintenance
+        normalize_sheet_dates()
+        dedupe_rows()
+        reset_filters_full_range()
+
+        print("[main] Run complete.")
+    except KeyboardInterrupt:
+        print("[main] Interrupted – flushing buffers.")
+        sheet_log("WARN", "main", "Interrupted by user – flushing buffers.")
+    except Exception as exc:
+        print(f"[main] Fatal – {type(exc).__name__}: {exc}")
+        sheet_log("ERROR", "main", f"Fatal: {type(exc).__name__}: {exc}")
+    finally:
+        flush_buffer()
+        if CLOSE_ON_EXIT:
+            safe_quit()
+        else:
+            print("[main] Browser left open – Ctrl+C here to exit.")
             try:
-                citi_logout()
-            except Exception:
-                pass
-        finally:
-            # Fully restart the browser between accounts to avoid stale state
-            if RESTART_BETWEEN_ACCOUNTS and i < len(ACCOUNTS):
-                restart_driver()
-
-    delete_expired_rows()
-    dedupe_rows()
-    reset_filters_full_range()
-    sheet_log("INFO", "main", "COMPLETE")
-    print("Run complete – offers synced and sheet updated.")
-
-
-print("Function 'main' loaded – orchestrator ready.")
+                while True:
+                    time.sleep(3600)
+            except KeyboardInterrupt:
+                print("[main] Exiting; leaving browser window as-is.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except (InvalidSessionIdException, WebDriverException):
-        print("Browser window closed – script ended by user.")
-        sheet_log("WARN", "main", "Browser closed – terminated by user")
-        sys.exit(0)
-    except Exception as exc:
-        print(f"Fatal error – {type(exc).__name__}: {exc}")
-        sheet_log("ERROR", "main", f"Fatal: {type(exc).__name__}: {exc}")
-        sys.exit(1)
-    finally:
-        safe_quit()
-
-print("Section 'main & entrypoint' complete – script ready for execution.")
+    main()
