@@ -49,17 +49,17 @@ if not (U1 and P1):
     sys.exit("Missing CHASE_USERNAME_1 / CHASE_PASSWORD_1 in .env")
 
 HOLDER = os.getenv("CHASE_HOLDER", "").strip()
-SHEET_KEY = os.getenv("GOOGLE_SHEET_KEY", "13M4YcJ5vPq4VEeNg1KOmE0QRyRVs9EDrroy66jH6iCs")
+SHEET_KEY = os.getenv("GOOGLE_SHEET_KEY", "").strip()
+if not SHEET_KEY:
+    sys.exit("Missing GOOGLE_SHEET_KEY in .env")
 SA_PATH = os.getenv("GOOGLE_SA_PATH", os.path.join(PROJECT_ROOT, "service_account.json"))
 require_file(SA_PATH, "Google service-account JSON")
 
-# Card order (accountIds)
-ACCOUNT_IDS = [
-    "1091891200",  # Freedom Flex
-    "571406113",   # IHG Classic
-    "504430043",   # Ink Business Cash
-    "1095857180",  # Ink Preferred
-]
+# Card order (accountIds) – loaded from .env
+ACCOUNT_IDS = [s.strip() for s in os.getenv("CHASE_ACCOUNT_IDS", "").split(",") if s.strip()]
+if not ACCOUNT_IDS:
+    sys.exit("Missing CHASE_ACCOUNT_IDS in .env (comma-separated)")
+
 
 # URLs
 CHASE_HOME_URL    = "https://www.chase.com/"
@@ -706,7 +706,7 @@ def enroll_all_offers_for_current_card(existing_rows: Set[Tuple[str,...]]) -> in
         # Wait briefly for detail OR immediate "Added" state
         t1 = time.time()
         navigated = False
-        while time.time() - t1 < 2.0:
+        while time.time() - t1 < 2.4:
             if driver.find_elements(By.XPATH, "//span[starts-with(normalize-space(),'Pay with ')]"):
                 navigated = True
                 break
@@ -763,6 +763,34 @@ def enroll_all_offers_for_current_card(existing_rows: Set[Tuple[str,...]]) -> in
 # -------------------------------
 # Card selection & navigation
 # -------------------------------
+def current_account_id() -> str:
+    """Read the hidden input value from the account <mds-select> (selected accountId)."""
+    try:
+        js = """
+        const sel = document.querySelector('mds-select#select-credit-card-account');
+        if (!sel) return '';
+        const inp = sel.querySelector('input[slot="form-associated-input"]');
+        return inp && inp.value ? String(inp.value) : '';
+        """
+        return driver.execute_script(js) or ""
+    except Exception:
+        return ""
+
+def wait_for_dropdown_ready(max_wait: float = 8.0) -> bool:
+    """Wait until the account dropdown has at least one option registered in the DOM."""
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        try:
+            ready = driver.execute_script(
+                "return !!document.querySelector('mds-select#select-credit-card-account mds-select-option');"
+            )
+            if ready:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
 def open_hub() -> bool:
     if not robust_get(CHASE_OFFER_HUB, tries=2):
         print("[hub] nav failed.")
@@ -777,8 +805,10 @@ def open_hub() -> bool:
     return False
 
 def select_account_by_id(acc_id: str) -> bool:
+    """Click the dropdown option for this accountId inside shadow DOM, then verify selection."""
     print(f"[acct] selecting {acc_id}")
     try:
+        # Open the dropdown
         trig = driver.find_elements(By.XPATH, "//button[@id='select-select-credit-card-account']")
         if trig:
             driver.execute_script("arguments[0].click();", trig[0])
@@ -788,6 +818,10 @@ def select_account_by_id(acc_id: str) -> bool:
                 driver.execute_script("arguments[0].click();", btn[0])
         time.sleep(0.25)
 
+        # Wait until the options are actually there (SPA sometimes lags)
+        wait_for_dropdown_ready(10.0)
+
+        # Click the option inside shadow DOM
         js_click = """
         const accId = arguments[0];
         const opt = document.querySelector('mds-select#select-credit-card-account mds-select-option[value="'+accId+'"]');
@@ -798,35 +832,77 @@ def select_account_by_id(acc_id: str) -> bool:
         """
         res = driver.execute_script(js_click, acc_id)
         print(f"[acct] shadow click: {res}")
-        time.sleep(CARD_LOAD_PAUSE)
-        return res == "ok"
+
+        # Verify the hidden input actually reflects the selection
+        t0 = time.time()
+        while time.time() - t0 < 8.0:
+            if current_account_id() == acc_id:
+                time.sleep(CARD_LOAD_PAUSE)
+                return True
+            time.sleep(0.12)
+
+        print("[acct] selection did not confirm in time.")
+        return False
     except Exception as exc:
         print(f"[acct] error: {exc}")
         return False
 
+
 def go_to_categories_for(acc_id: str) -> bool:
+    """
+    Hub-first navigation:
+      1) open offer-hub
+      2) select account
+      3) wait for add buttons on hub; click "All" tab if present
+      4) only if still no tiles after ~6s, fall back ONCE to categories ALL
+    """
     if not open_hub():
         return False
-    _ = select_account_by_id(acc_id)  # best effort
 
-    # Hash-only route change is more reliable in SPA:
-    hash_route = f"/dashboard/merchantOffers/offerCategoriesPage?accountId={acc_id}&offerCategoryName=ALL"
-    try:
-        driver.execute_script("window.location.hash = arguments[0];", hash_route)
-    except Exception:
-        pass
-    time.sleep(0.6)
+    _ = select_account_by_id(acc_id)  # best effort; we verify tiles below
 
-    # Wait until correct account + tiles present
+    # Try to stay on offer-hub and get tiles
+    tried_click_all = False
+    applied_fallback_hash = False
     t0 = time.time()
-    while time.time() - t0 < 12.0:
-        u = driver.current_url or ""
-        on_cat = ("/merchantOffers/offerCategoriesPage" in u) and (acc_id in u)
-        dom_ok = add_buttons_present() or categories_shell_present()
-        if on_cat and dom_ok:
-            time.sleep(0.3)
+    while time.time() - t0 < 14.0:
+        if add_buttons_present():
             return True
-        time.sleep(0.2)
+
+        # Try clicking an "All" tab/link if present on hub once
+        if not tried_click_all:
+            try:
+                all_tabs = driver.find_elements(
+                    By.XPATH,
+                    "//*[self::a or self::button][normalize-space()='All' or contains(., 'All')]"
+                )
+                if all_tabs:
+                    driver.execute_script("arguments[0].click();", all_tabs[0])
+                    tried_click_all = True
+                    time.sleep(0.9)
+                    continue
+            except Exception:
+                tried_click_all = True  # don't loop on this
+
+        # After ~6s, apply a single fallback to categories ALL
+        if not applied_fallback_hash and (time.time() - t0 > 6.0):
+            try:
+                hash_route = f"/dashboard/merchantOffers/offerCategoriesPage?accountId={acc_id}&offerCategoryName=ALL"
+                driver.execute_script("window.location.hash = arguments[0];", hash_route)
+                applied_fallback_hash = True
+                time.sleep(0.8)
+                continue
+            except Exception:
+                applied_fallback_hash = True
+
+        # Accept either hub shell or categories shell while we wait
+        if categories_shell_present():
+            if add_buttons_present():
+                return True
+        time.sleep(0.25)
+
+    print("[cat] categories/hub not confirmed with visible add buttons.")
+    return add_buttons_present()
 
     # Last nudge: click any categories link once
     try:
@@ -857,25 +933,38 @@ def process_cards():
     total_rows  = 0
 
     for idx, acc_id in enumerate(ACCOUNT_IDS, start=1):
+        if acc_id in FINISHED_ACCOUNTS:
+            print(f"\n----- Card {idx}/{len(ACCOUNT_IDS)} – accountId={acc_id} (already finished; skipping)")
+            continue
+
         print(f"\n----- Card {idx}/{len(ACCOUNT_IDS)} – accountId={acc_id}")
         try:
             if not go_to_categories_for(acc_id):
-                print("[card] categories view not ready; skipping.")
+                print("[card] offers view not ready; skipping.")
+                FINISHED_ACCOUNTS.add(acc_id)  # don't bounce back to a broken one in this run
                 total_cards += 1
                 continue
 
+            # Quick read of visible add buttons before starting
+            had_buttons = len(find_add_buttons())
             added = enroll_all_offers_for_current_card(existing_rows)
             print(f"[card] {idx} -> {added} new row(s).")
             total_rows += max(0, added)
             total_cards += 1
+
+            # Mark as finished if nothing else to add (either no buttons or nothing added)
+            if added == 0 or not had_buttons:
+                FINISHED_ACCOUNTS.add(acc_id)
         except Exception as exc:
             sheet_log("ERROR", "card", f"{acc_id}: {type(exc).__name__}: {exc}")
             print(f"[card] error {acc_id}: {exc}")
+            FINISHED_ACCOUNTS.add(acc_id)
             continue
 
         time.sleep(0.7)
 
     print(f"[cards] complete – {total_cards} card(s), {total_rows} row(s).")
+
 
 # -------------------------------
 # Sheet maintenance
@@ -926,6 +1015,9 @@ def reset_filters_full_range():
 # -------------------------------
 def flush_buffer():
     global APPEND_BUFFER, CURRENT_CARD_BUFFER
+
+    # In-run memory of finished accountIds (no need to revisit)
+    FINISHED_ACCOUNTS: Set[str] = set()
     if CURRENT_CARD_BUFFER:
         APPEND_BUFFER.extend(CURRENT_CARD_BUFFER)
         CURRENT_CARD_BUFFER = []
@@ -962,8 +1054,6 @@ def main():
         if not wait_for_post_login(LOGIN_WAIT_MAX):
             print("[main] Post-login not detected – aborting.")
             return
-
-        process_cards()
 
         # 3) Process cards
         process_cards()
