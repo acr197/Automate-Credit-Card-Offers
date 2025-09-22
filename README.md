@@ -1,4 +1,4 @@
-# 🏦 Chase Offers Automation
+# 🏦 Amex Offers Automation
 
 This project started with a very relatable problem:  
 manually clicking through Credit Card Offers takes forever, and my spreadsheet brain demanded better.  
