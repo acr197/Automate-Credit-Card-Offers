@@ -4,6 +4,12 @@
 
 Each script was built with Python, Selenium, and Google Sheets API — co-written with ChatGPT to accelerate debugging and handle messy edge cases. The same pattern could be applied to any tedious, click-heavy process in marketing, analytics, or operations.
 
+## 🎥 Live Demo
+- 📂 [Download on GitHub](./Automate-Credit-Card-Offers-Live-Demo.mp4)
+- ▶️ [Stream on Google Drive](https://drive.google.com/file/d/1g538OLO0Cewoo_qWsh_ozZruxMhkXJ9L/view?usp=sharing)
+
+🍿 Special orders accepted for the *Director’s Cut* — a 90-minute trilogy with bonus commentary.
+
 ---
 
 ## ✨ Why this matters
