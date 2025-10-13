@@ -6,7 +6,7 @@ Each script was built with Python, Selenium, and Google Sheets API — co-writte
 
 ## 🎥 Live Demo
 - 📂 [Download on GitHub](./Automate-Credit-Card-Offers-Live-Demo.mp4)
-- ▶️ [Stream on Google Drive](https://youtu.be/susAiBKjLE4?si=xjVPC5doEoSpn8Qs)
+- ▶️ [Watch on YouTube](https://youtu.be/susAiBKjLE4?si=xjVPC5doEoSpn8Qs)
 
 🍿 Special orders accepted for the *Director’s Cut* — a 90-minute trilogy with bonus commentary.
 
